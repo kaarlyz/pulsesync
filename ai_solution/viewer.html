@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PulseSync 3D // Mahony 6-DOF Responsive Viewer</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #030706;
+    color: #9ee6c5;
+    font: 12px/1.5 monospace;
+    overflow: hidden;
+    user-select: none;
+  }
+  canvas {
+    width: 100vw;
+    height: 100vh;
+    display: block;
+    cursor: grab;
+  }
+  canvas:active { cursor: grabbing; }
+  #hud {
+    position: fixed;
+    top: 12px;
+    left: 14px;
+    white-space: pre;
+    pointer-events: none;
+    background: rgba(3, 7, 6, 0.85);
+    padding: 12px 16px;
+    border-radius: 8px;
+    border: 1px solid #132b22;
+    backdrop-filter: blur(8px);
+    line-height: 1.6;
+    font-size: 11px;
+    color: #94a3b8;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+  }
+  .tag { color: #fff; font-weight: bold; }
+  .val { color: #38bdf8; font-weight: bold; }
+  .ok { color: #10b981; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">CONNECTING TO UDP STREAM...</div>
+<script>
+"use strict";
+
+// ---------------- tunables (Mahony 6-DOF AHRS) ----------------
+const G = 9.80665;
+const KP = 2.0;            // accel correction gain
+const TRUST_BAND = 0.25;   // accel weight falls to 0 during high jerk
+const MAX_EXTRAP = 0.06;   // s, cap on dead-reckoning
+const SMOOTH = 0.16;       // Eka's golden buttery smoothing factor (100 FPS)
+const LEAD = 0.0;
+
+// ---------------- quaternion math: q = [w,x,y,z], body -> world ----------------
+const qMul = (a, b) => [
+  a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3],
+  a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2],
+  a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1],
+  a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0]];
+
+const qNorm = (q) => { const n = Math.hypot(q[0], q[1], q[2], q[3]) || 1; return [q[0]/n, q[1]/n, q[2]/n, q[3]/n]; };
+
+function qInteg(q, wx, wy, wz, dt) {
+  const wn = Math.hypot(wx, wy, wz), th = wn * dt;
+  if (th < 1e-9) return q;
+  const s = Math.sin(th / 2) / wn;
+  return qNorm(qMul(q, [Math.cos(th / 2), wx * s, wy * s, wz * s]));
+}
+
+function nlerp(a, b, k) {
+  const s = (a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]) < 0 ? -1 : 1;
+  return qNorm([0, 1, 2, 3].map(i => a[i] + (s * b[i] - a[i]) * k));
+}
+
+function qFromUp(ax, ay, az) {
+  const n = Math.hypot(ax, ay, az) || 1;
+  ax /= n; ay /= n; az /= n;
+  if (1 + az < 1e-6) return [0, 1, 0, 0];
+  return qNorm([1 + az, ay, -ax, 0]);
+}
+
+const toMat = ([w, x, y, z]) => [
+  1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y),
+  2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x),
+  2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y)];
+
+// ---------------- filter state ----------------
+const st = {
+  q: [1, 0, 0, 0], w: [0, 0, 0], bias: [0, 0, 0], still: 0, init: false, tArrive: 0,
+  tPrevUs: 0, period: 0.02, periodInit: false, seq: 0, seqSeen: false,
+  lost: 0, cnt: 0, pps: 0, an: G, trust: 1, hr: 89, steps: 14,
+};
+
+function step(ax, ay, az, gx, gy, gz, dt) {
+  const an = Math.hypot(ax, ay, az), dev = Math.abs(an - G);
+  st.an = an;
+
+  const b = st.bias;
+  const wm = Math.hypot(gx - b[0], gy - b[1], gz - b[2]);
+  if (dev < 0.35 && wm < 0.10) {
+    if (++st.still > 50) { b[0] += 0.01 * (gx - b[0]); b[1] += 0.01 * (gy - b[1]); b[2] += 0.01 * (gz - b[2]); }
+  } else st.still = 0;
+  const wx = gx - b[0], wy = gy - b[1], wz = gz - b[2];
+
+  let cx = 0, cy = 0, cz = 0;
+  const trust = an > 1e-3 ? Math.max(0, 1 - dev / (TRUST_BAND * G)) : 0;
+  st.trust = trust;
+  if (trust > 0) {
+    const ux = ax / an, uy = ay / an, uz = az / an;
+    const [qw, qx, qy, qz] = st.q;
+    const vx = 2 * (qx*qz - qw*qy), vy = 2 * (qw*qx + qy*qz), vz = qw*qw - qx*qx - qy*qy + qz*qz;
+    const k = KP * trust;
+    cx = k * (uy*vz - uz*vy); cy = k * (uz*vx - ux*vz); cz = k * (ux*vy - uy*vx);
+  }
+  st.q = qInteg(st.q, wx + cx, wy + cy, wz + cz, dt);
+  st.w = [wx, wy, wz];
+}
+
+// ---------------- transport (WebSocket from pulsesync_server.py) ----------------
+function onPacket(buf) {
+  const now = performance.now(), dv = new DataView(buf);
+  if (dv.byteLength < 17 || dv.getUint16(0, true) !== 0x5350 || dv.getUint8(2) !== 1) return;
+  const type = dv.getUint8(3), seq = dv.getUint32(4, true), tUs = Number(dv.getBigUint64(8, true));
+
+  if (st.seqSeen) {
+    const gap = (seq - st.seq - 1) | 0;
+    if (gap < 0) return;
+    st.lost += gap;
+  }
+  st.seq = seq; st.seqSeen = true;
+
+  if (type === 2 && dv.byteLength >= 32) {
+    st.hr = dv.getInt32(16, true);
+    st.steps = dv.getInt32(20, true);
+    return;
+  }
+  if (type !== 1) return;
+
+  const n = dv.getUint8(16);
+  if (n === 0 || dv.byteLength < 17 + 24 * n) return;
+
+  const dtPkt = st.tPrevUs ? (tUs - st.tPrevUs) * 1e-6 : 0;
+  st.tPrevUs = tUs;
+  let dt = st.period;
+  if (dtPkt > 0 && dtPkt < 0.5) {
+    const raw = dtPkt / n;
+    if (!st.periodInit) { st.period = Math.min(Math.max(raw, 0.002), 0.05); st.periodInit = true; dt = st.period; }
+    else if (raw > 1.8 * st.period) dt = raw;
+    else st.period += 0.05 * (Math.max(raw, 0.4 * st.period) - st.period);
+  }
+
+  let o = 17;
+  for (let i = 0; i < n; i++, o += 24) {
+    const f = (k) => dv.getFloat32(o + 4 * k, true);
+    if (!st.init) { st.q = qFromUp(f(0), f(1), f(2)); st.init = true; }
+    step(f(0), f(1), f(2), f(3), f(4), f(5), dt);
+  }
+  st.tArrive = now; st.cnt++;
+}
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = (ev) => onPacket(ev.data);
+  ws.onclose = () => setTimeout(connect, 500);
+  ws.onerror = () => ws.close();
+}
+connect();
+
+// Tare / Zero Heading (Spasi / R)
+addEventListener("keydown", (e) => {
+  if (e.key.toLowerCase() !== "r" && e.code !== "Space") return;
+  if (!st.init) return;
+  const m = toMat(st.q), h = -Math.atan2(m[3], m[0]) / 2;
+  st.q = qNorm(qMul([Math.cos(h), 0, 0, Math.sin(h)], st.q));
+});
+
+// ---------------- render (Solid Mesh + Mouse Orbit 360°) ----------------
+const cv = document.getElementById("c"), cx = cv.getContext("2d"), hud = document.getElementById("hud");
+let dpr = 1;
+function resize() { dpr = window.devicePixelRatio || 1; cv.width = innerWidth * dpr; cv.height = innerHeight * dpr; }
+addEventListener("resize", resize); resize();
+
+// Body frame = sensor frame: x lateral, y along strap, z out of the screen
+const bodyVertices = [
+  [-36, -85, -12], [36, -85, -12], [36, 85, -12], [-36, 85, -12], // back
+  [-36, -85,  12], [36, -85,  12], [36, 85,  12], [-36, 85,  12]  // front screen
+];
+const screenVertices = [
+  [-28, -70, 13], [28, -70, 13], [28, 70, 13], [-28, 70, 13]
+];
+const strapTop = [
+  [-26, 85, -8], [26, 85, -8], [26, 145, -8], [-26, 145, -8]
+];
+const strapBottom = [
+  [-26, -85, -8], [26, -85, -8], [26, -145, -8], [-26, -145, -8]
+];
+const bodyFaces = [
+  [0, 1, 2, 3], // back
+  [4, 5, 6, 7], // front
+  [0, 1, 5, 4], // bottom
+  [2, 3, 7, 6], // top
+  [0, 3, 7, 4], // left
+  [1, 2, 6, 5]  // right
+];
+const bodyEdges = [
+  [0,1], [1,2], [2,3], [3,0],
+  [4,5], [5,6], [6,7], [7,4],
+  [0,4], [1,5], [2,6], [3,7]
+];
+
+// Interactive Mouse Drag 360° Orbit
+let camAz = -30 * Math.PI / 180, camEl = 28 * Math.PI / 180;
+let isDragging = false, prevMX = 0, prevMY = 0;
+
+cv.addEventListener('mousedown', (e) => { isDragging = true; prevMX = e.clientX; prevMY = e.clientY; });
+window.addEventListener('mouseup', () => isDragging = false);
+window.addEventListener('mousemove', (e) => {
+  if (!isDragging) return;
+  camAz += (e.clientX - prevMX) * 0.008;
+  camEl = Math.max(-1.4, Math.min(1.4, camEl + (e.clientY - prevMY) * 0.008));
+  prevMX = e.clientX; prevMY = e.clientY;
+});
+
+function project(x, y, z) {
+  const caz = Math.cos(camAz), saz = Math.sin(camAz);
+  const cel = Math.cos(camEl), sel = Math.sin(camEl);
+
+  const x1 = caz * x - saz * y;
+  const y1 = saz * x + caz * y;
+  const y2 = cel * y1 - sel * z;
+  const z2 = sel * y1 + cel * z;
+
+  const FOCAL = 380, DIST = 450;
+  const s = (FOCAL * dpr) / (y2 + DIST);
+  return [cv.width / 2 + x1 * s, cv.height / 2 - z2 * s];
+}
+
+function line(a, b, color, w) {
+  cx.strokeStyle = color; cx.lineWidth = w * dpr;
+  cx.beginPath(); cx.moveTo(a[0], a[1]); cx.lineTo(b[0], b[1]); cx.stroke();
+}
+
+function draw(q) {
+  const m = toMat(q);
+  cx.clearRect(0, 0, cv.width, cv.height);
+
+  // 1. Concentric Circular Ground Radar Grid on Desk (Z = -50)
+  cx.strokeStyle = "rgba(16, 185, 129, 0.22)";
+  cx.lineWidth = 1 * dpr;
+  for (let r = 50; r <= 190; r += 45) {
+    cx.beginPath();
+    for (let th = 0; th <= Math.PI * 2 + 0.1; th += Math.PI / 16) {
+      const p = project(r * Math.cos(th), r * Math.sin(th), -50);
+      if (th === 0) cx.moveTo(p[0], p[1]); else cx.lineTo(p[0], p[1]);
+    }
+    cx.stroke();
+  }
+
+  // 2. World Reference Axes
+  const o = project(0, 0, -50);
+  for (const [x, y, z, c, l] of [[1, 0, 0, "#ef4444", "X0 (East)"], [0, 1, 0, "#22c55e", "Y0 (North)"], [0, 0, 1, "#38bdf8", "UP"]]) {
+    const p = project(x * 130, y * 130, z * 130 - 50);
+    line(o, p, c, 1.2); cx.fillStyle = c; cx.font = `${11 * dpr}px monospace`; cx.fillText(l, p[0] + 4 * dpr, p[1]);
+  }
+
+  // 3. Transform Smartband Geometry
+  function tf([x, y, z]) {
+    const wx = m[0]*x + m[1]*y + m[2]*z;
+    const wy = m[3]*x + m[4]*y + m[5]*z;
+    const wz = m[6]*x + m[7]*y + m[8]*z;
+    return project(wx, wy, wz);
+  }
+
+  const pBody = bodyVertices.map(tf);
+  const pScreen = screenVertices.map(tf);
+  const pStrapT = strapTop.map(tf);
+  const pStrapB = strapBottom.map(tf);
+
+  // Draw Silicone Straps (Green Solid)
+  [pStrapT, pStrapB].forEach(st => {
+    cx.fillStyle = "#047857";
+    cx.strokeStyle = "#10b981";
+    cx.lineWidth = 2 * dpr;
+    cx.beginPath();
+    cx.moveTo(st[0][0], st[0][1]);
+    for (let i = 1; i < st.length; i++) cx.lineTo(st[i][0], st[i][1]);
+    cx.closePath();
+    cx.fill(); cx.stroke();
+
+    // Grooves
+    for (let t = 0.25; t <= 0.75; t += 0.25) {
+      const rx1 = st[0][0] + (st[3][0] - st[0][0]) * t;
+      const ry1 = st[0][1] + (st[3][1] - st[0][1]) * t;
+      const rx2 = st[1][0] + (st[2][0] - st[1][0]) * t;
+      const ry2 = st[1][1] + (st[2][1] - st[1][1]) * t;
+      cx.strokeStyle = "rgba(52, 211, 153, 0.6)";
+      cx.lineWidth = 1.2 * dpr;
+      cx.beginPath(); cx.moveTo(rx1, ry1); cx.lineTo(rx2, ry2); cx.stroke();
+    }
+  });
+
+  // Solid Shaded Capsule Body
+  const faceColors = ["#042f2e", "#0f3d32", "#064e3b", "#064e3b", "#033b31", "#033b31"];
+  bodyFaces.forEach((f, idx) => {
+    cx.fillStyle = faceColors[idx];
+    cx.beginPath();
+    cx.moveTo(pBody[f[0]][0], pBody[f[0]][1]);
+    for (let i = 1; i < f.length; i++) cx.lineTo(pBody[f[i]][0], pBody[f[i]][1]);
+    cx.closePath();
+    cx.fill();
+  });
+
+  // Chassis Edges
+  cx.strokeStyle = "#34d399";
+  cx.lineWidth = 2.5 * dpr;
+  bodyEdges.forEach(([i, j]) => {
+    cx.beginPath();
+    cx.moveTo(pBody[i][0], pBody[i][1]);
+    cx.lineTo(pBody[j][0], pBody[j][1]);
+    cx.stroke();
+  });
+
+  // AMOLED Screen Glass (Cyan Glowing)
+  cx.fillStyle = "rgba(56, 189, 248, 0.35)";
+  cx.strokeStyle = "#38bdf8";
+  cx.lineWidth = 2.5 * dpr;
+  cx.beginPath();
+  cx.moveTo(pScreen[0][0], pScreen[0][1]);
+  for (let i = 1; i < pScreen.length; i++) cx.lineTo(pScreen[i][0], pScreen[i][1]);
+  cx.closePath();
+  cx.fill(); cx.stroke();
+
+  // Screen Center Reticle
+  const scrC = [(pScreen[0][0] + pScreen[2][0]) / 2, (pScreen[0][1] + pScreen[2][1]) / 2];
+  cx.beginPath();
+  cx.arc(scrC[0], scrC[1], 4.5 * dpr, 0, Math.PI * 2);
+  cx.fillStyle = "#38bdf8";
+  cx.shadowColor = "#38bdf8";
+  cx.shadowBlur = 10 * dpr;
+  cx.fill();
+  cx.shadowBlur = 0;
+}
+
+let qShow = [1, 0, 0, 0], shown = false, tWin = 0;
+
+function frame(t) {
+  if (st.init) {
+    const ahead = Math.min(Math.max((t - st.tArrive) / 1000 + LEAD, 0), MAX_EXTRAP);
+    const qPred = qInteg(st.q, st.w[0], st.w[1], st.w[2], ahead);
+    if (!shown) { qShow = qPred; shown = true; }
+    else {
+      // Golden smooth interpolation (0.16) for buttery 100 FPS motion
+      qShow = nlerp(qShow, qPred, SMOOTH);
+    }
+  }
+  draw(qShow);
+
+  if (t - tWin > 1000) { st.pps = st.cnt * 1000 / (t - tWin); st.cnt = 0; tWin = t; }
+
+  const m = toMat(qShow);
+  const roll = Math.atan2(m[7], m[8]) * 57.2958;
+  const pitch = Math.asin(-Math.max(-1, Math.min(1, m[6]))) * 57.2958;
+  const yaw = Math.atan2(m[3], m[0]) * 57.2958;
+
+  hud.innerHTML =
+    `<span class="tag">PULSESYNC // MAHONY 6-DOF HUD</span>\n` +
+    `Stream:   <span class="val">${st.pps.toFixed(0)} pkt/s</span> (lost: ${st.lost}, period: ${(st.period * 1000).toFixed(1)} ms)\n` +
+    `Gravity:  |a| ${st.an.toFixed(2)} m/s²  (trust: ${(st.trust * 100).toFixed(0)}%)\n` +
+    `Kinetic:  Roll: ${(roll >= 0 ? '+' : '') + roll.toFixed(1)}° | Pitch: ${(pitch >= 0 ? '+' : '') + pitch.toFixed(1)}° | Yaw: ${(yaw >= 0 ? '+' : '') + yaw.toFixed(1)}°\n` +
+    `Biometry: ♥ <span class="val">${st.hr} BPM</span> | 👟 <span class="val">${st.steps} steps</span>\n` +
+    `Control:  Drag Mouse: Orbit 360° | [Spasi / R]: Tare Heading`;
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

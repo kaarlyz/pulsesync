@@ -1,0 +1,9 @@
+# Binaries & large archives
+firmware/
+*.apk
+*.zip
+*.bin
+*.log
+debug.keystore
+build/
+.gradle/
