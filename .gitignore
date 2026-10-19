@@ -7,3 +7,5 @@ firmware/
 debug.keystore
 build/
 .gradle/
+notify_apk/
+notify_decompiled/
